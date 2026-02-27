@@ -1,0 +1,67 @@
+[package]
+name = "mdink"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.86.0"
+description = "A terminal markdown renderer with syntax highlighting and image support"
+license = "MIT"
+homepage = "https://github.com/OWNER/mdink"
+repository = "https://github.com/OWNER/mdink"
+readme = "README.md"
+keywords = ["markdown", "terminal", "tui", "renderer"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+# Phase 1
+ratatui = { version = "0.30", features = ["crossterm"] }
+pulldown-cmark = { version = "0.13", features = ["simd"] }
+clap = { version = "4", features = ["derive"] }
+unicode-width = "0.2"
+textwrap = "0.16"
+color-eyre = "0.6"
+# Phase 2 (commented until needed)
+# syntect = "5.2"
+# Phase 4 (commented until needed)
+# ratatui-image = { version = "10", default-features = false, features = ["image-defaults", "crossterm"] }
+# image = "0.25"
+# Phase 5 (commented until needed)
+# serde = { version = "1", features = ["derive"] }
+# serde_json = "1"
+# dirs = "5"
+
+# ── Release profile ──────────────────────────────────────────────
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"        # keep symbol names for backtraces
+
+# ── Distribution profile (used by cargo-deb and CI releases) ────
+[profile.dist]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+# ── Debian packaging (cargo-deb reads this) ─────────────────────
+[package.metadata.deb]
+maintainer = "mdink contributors"
+copyright = "2026, mdink contributors"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+mdink is a terminal-based markdown renderer inspired by glow. \
+It features syntax-highlighted code blocks, inline terminal images \
+(Sixel/Kitty/iTerm2), configurable JSON themes, and vim-style navigation."""
+section = "utils"
+priority = "optional"
+depends = "$auto"
+assets = [
+    ["target/release/mdink",                  "usr/bin/",                                "755"],
+    ["assets/mdink.1.gz",                     "usr/share/man/man1/",                     "644"],
+    ["assets/completions/mdink.bash",         "usr/share/bash-completion/completions/",  "644"],
+    ["assets/completions/mdink.fish",         "usr/share/fish/vendor_completions.d/",    "644"],
+    ["assets/completions/_mdink",             "usr/share/zsh/vendor-completions/",       "644"],
+    ["README.md",                             "usr/share/doc/mdink/README",              "644"],
+]
