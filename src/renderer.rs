@@ -86,8 +86,12 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let percent = app.scroll_percent();
-    let current_line = app.scroll_offset + 1;
     let total_lines = app.document.total_height;
+    let current_line = if total_lines == 0 {
+        0
+    } else {
+        app.scroll_offset + 1
+    };
 
     let status_text = format!(
         " {} | {}% | {}/{} ",

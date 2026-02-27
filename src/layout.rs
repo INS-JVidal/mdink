@@ -39,7 +39,8 @@ pub enum DocumentLine {
 /// inserted between adjacent blocks for visual spacing.
 pub fn flatten(blocks: &[RenderedBlock], width: u16) -> PreRenderedDocument {
     let mut lines: Vec<DocumentLine> = Vec::new();
-    let width = width as usize;
+    // Clamp to minimum width of 1 to avoid undefined textwrap behavior.
+    let width = (width as usize).max(1);
 
     for (i, block) in blocks.iter().enumerate() {
         // Inter-block spacing (not before the first block).
@@ -89,25 +90,31 @@ pub fn flatten(blocks: &[RenderedBlock], width: u16) -> PreRenderedDocument {
 /// Wraps styled spans to fit within a given width, preserving styles.
 ///
 /// Algorithm:
-/// 1. Concatenate all span text into a single plain-text string.
+/// 1. Concatenate all span text into a single plain-text string, building
+///    a parallel byte-to-style map.
 /// 2. Use `textwrap::wrap()` to determine line break positions.
-/// 3. Map each wrapped line back to styled `Span`s by walking a cursor
-///    through the original `StyledSpan`s and splitting at boundaries.
+/// 3. Walk a cursor through the plain text for each wrapped line, skipping
+///    whitespace break points, then extract styled spans by consulting
+///    the byte-to-style map.
 fn wrap_styled_spans(spans: &[StyledSpan], width: usize) -> Vec<Line<'static>> {
     if spans.is_empty() {
         return Vec::new();
     }
 
     // Handle hard breaks (\n) by splitting into sub-paragraphs.
-    // Check if any span contains a newline.
-    let has_hard_break = spans.iter().any(|s| s.text.contains('\n'));
-
-    if has_hard_break {
+    if spans.iter().any(|s| s.text.contains('\n')) {
         return wrap_with_hard_breaks(spans, width);
     }
 
-    // 1. Build the plain-text string.
-    let plain: String = spans.iter().map(|s| s.text.as_str()).collect();
+    // 1. Build plain text and parallel byte-to-style map.
+    let mut plain = String::new();
+    let mut byte_styles: Vec<Style> = Vec::new();
+    for span in spans {
+        for _ in span.text.bytes() {
+            byte_styles.push(span.style);
+        }
+        plain.push_str(&span.text);
+    }
 
     if plain.is_empty() {
         return Vec::new();
@@ -118,22 +125,84 @@ fn wrap_styled_spans(spans: &[StyledSpan], width: usize) -> Vec<Line<'static>> {
         .word_separator(textwrap::WordSeparator::UnicodeBreakProperties);
     let wrapped_lines = textwrap::wrap(&plain, &wrap_options);
 
-    // 3. Map each wrapped line back to styled spans.
+    // 3. Map each wrapped line back to styled spans using a monotonic cursor.
     let mut result = Vec::with_capacity(wrapped_lines.len());
-    let mut char_offset: usize = 0;
+    let mut cursor: usize = 0;
 
     for wrapped_text in &wrapped_lines {
-        let line_spans = extract_styled_line(spans, &mut char_offset, wrapped_text);
+        // Skip whitespace between wrapped lines (break points consumed by textwrap).
+        // Only advance forward — the cursor never goes backward.
+        while cursor < plain.len() {
+            if plain[cursor..].starts_with(wrapped_text.as_ref()) {
+                break;
+            }
+            // Advance by one character (not one byte) to stay on char boundaries.
+            let ch_len = plain[cursor..]
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(1);
+            cursor += ch_len;
+        }
+
+        let line_start = cursor;
+        let line_end = cursor + wrapped_text.len();
+        // Clamp to plain text length for safety.
+        let line_end = line_end.min(plain.len());
+
+        let line_spans = build_spans_for_range(&plain, &byte_styles, line_start, line_end);
         result.push(Line::from(line_spans));
+
+        cursor = line_end;
     }
 
     result
 }
 
+/// Builds styled `Span`s for a byte range of the plain text.
+///
+/// Walks through the range by characters, grouping consecutive bytes
+/// that share the same style into a single `Span`. All slicing happens
+/// at character boundaries.
+fn build_spans_for_range(
+    plain: &str,
+    byte_styles: &[Style],
+    start: usize,
+    end: usize,
+) -> Vec<Span<'static>> {
+    if start >= end || start >= plain.len() {
+        return Vec::new();
+    }
+
+    let segment = &plain[start..end];
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run_start = start;
+    let mut run_style = byte_styles[start];
+
+    for (i, _ch) in segment.char_indices() {
+        let abs_pos = start + i;
+        if byte_styles[abs_pos] != run_style {
+            let text = &plain[run_start..abs_pos];
+            if !text.is_empty() {
+                spans.push(Span::styled(text.to_string(), run_style));
+            }
+            run_start = abs_pos;
+            run_style = byte_styles[abs_pos];
+        }
+    }
+
+    // Emit final run.
+    let text = &plain[run_start..end];
+    if !text.is_empty() {
+        spans.push(Span::styled(text.to_string(), run_style));
+    }
+
+    spans
+}
+
 /// Handles text containing hard breaks by splitting at `\n` boundaries
 /// first, then wrapping each segment independently.
 fn wrap_with_hard_breaks(spans: &[StyledSpan], width: usize) -> Vec<Line<'static>> {
-    // Split spans at \n boundaries into groups, then wrap each group.
     let mut groups: Vec<Vec<StyledSpan>> = Vec::new();
     let mut current_group: Vec<StyledSpan> = Vec::new();
 
@@ -175,120 +244,11 @@ fn wrap_with_hard_breaks(spans: &[StyledSpan], width: usize) -> Vec<Line<'static
     result
 }
 
-/// Extracts styled `Span`s for a single wrapped line by walking through
-/// the original spans from `char_offset`.
-///
-/// Updates `char_offset` in place to point past the consumed characters
-/// (including any whitespace eaten by the wrapping algorithm).
-fn extract_styled_line(
-    spans: &[StyledSpan],
-    char_offset: &mut usize,
-    wrapped_text: &str,
-) -> Vec<Span<'static>> {
-    let mut line_spans: Vec<Span<'static>> = Vec::new();
-    let mut remaining = wrapped_text.len();
-
-    // Skip leading whitespace that textwrap trimmed from the start of continuation lines.
-    skip_consumed_whitespace(spans, char_offset, wrapped_text);
-
-    // Walk through original spans and extract the portion that belongs to this line.
-    let mut span_idx = 0;
-    let mut local_offset = 0;
-
-    // Find which span and position within it corresponds to char_offset.
-    let mut cumulative = 0;
-    for (i, span) in spans.iter().enumerate() {
-        if cumulative + span.text.len() > *char_offset {
-            span_idx = i;
-            local_offset = *char_offset - cumulative;
-            break;
-        }
-        cumulative += span.text.len();
-        if i == spans.len() - 1 {
-            span_idx = spans.len();
-        }
-    }
-
-    while remaining > 0 && span_idx < spans.len() {
-        let span = &spans[span_idx];
-        let available = &span.text[local_offset..];
-        let take = remaining.min(available.len());
-        let segment = &available[..take];
-
-        if !segment.is_empty() {
-            line_spans.push(Span::styled(segment.to_string(), ratatui_style(span.style)));
-        }
-
-        *char_offset += take;
-        remaining -= take;
-        local_offset = 0;
-        span_idx += 1;
-    }
-
-    // Skip trailing whitespace/space that textwrap consumed as a break point.
-    skip_break_whitespace(spans, char_offset);
-
-    line_spans
-}
-
-/// Skips whitespace at the current char_offset that textwrap consumed
-/// as a line break point (the space between words where wrapping occurs).
-fn skip_break_whitespace(spans: &[StyledSpan], char_offset: &mut usize) {
-    let mut cumulative = 0;
-    for span in spans {
-        let span_end = cumulative + span.text.len();
-        if *char_offset >= cumulative && *char_offset < span_end {
-            let local = *char_offset - cumulative;
-            if local < span.text.len() {
-                let ch = span.text.as_bytes()[local];
-                if ch == b' ' {
-                    *char_offset += 1;
-                }
-            }
-            return;
-        }
-        cumulative = span_end;
-    }
-}
-
-/// Adjusts char_offset to account for leading whitespace that textwrap
-/// stripped from a continuation line.
-fn skip_consumed_whitespace(spans: &[StyledSpan], char_offset: &mut usize, wrapped_text: &str) {
-    // textwrap preserves the text content but may strip leading spaces
-    // from continuation lines. We need to find where wrapped_text starts
-    // in the original text.
-    let plain: String = spans.iter().map(|s| s.text.as_str()).collect();
-    if *char_offset < plain.len() && !wrapped_text.is_empty() {
-        // Find the wrapped text starting from char_offset
-        if let Some(pos) = plain[*char_offset..].find(wrapped_text) {
-            *char_offset += pos;
-        }
-    }
-}
-
-/// Converts our `ratatui::style::Style` to itself (identity — both are
-/// the same type, but this function exists as a documentation marker
-/// showing that `StyledSpan.style` is already a ratatui `Style`).
-fn ratatui_style(style: Style) -> Style {
-    // StyledSpan already uses ratatui::style::Style. In Phase 5, this
-    // may become a conversion from theme types to ratatui types.
-    style
-}
-
-/// Converts a `Style` to a heading-prefixed line (adds a leading marker).
-///
-/// Currently unused — headings are rendered the same as paragraphs but
-/// with different styles applied at parse time.
-#[allow(dead_code)]
-fn heading_prefix(level: u8) -> String {
-    "#".repeat(level as usize) + " "
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::parser::StyledSpan;
-    use ratatui::style::{Modifier, Style};
+    use ratatui::style::{Color, Modifier, Style};
 
     fn plain_span(text: &str) -> StyledSpan {
         StyledSpan {
@@ -328,8 +288,11 @@ mod tests {
             content: vec![plain_span(long_text.trim())],
         }];
         let doc = flatten(&blocks, 40);
-        // Should produce more than 1 line when wrapping at 40 cols.
-        assert!(doc.total_height > 1, "expected wrapping, got {} lines", doc.total_height);
+        assert!(
+            doc.total_height > 1,
+            "expected wrapping, got {} lines",
+            doc.total_height
+        );
     }
 
     #[test]
@@ -382,7 +345,6 @@ mod tests {
 
     #[test]
     fn test_layout_single_long_word() {
-        // A single word longer than the width — textwrap will break it.
         let blocks = vec![RenderedBlock::Paragraph {
             content: vec![plain_span("abcdefghijklmnopqrstuvwxyz")],
         }];
@@ -394,7 +356,6 @@ mod tests {
     fn test_layout_empty_paragraph() {
         let blocks = vec![RenderedBlock::Paragraph { content: vec![] }];
         let doc = flatten(&blocks, 80);
-        // Empty content should produce an empty line.
         assert_eq!(doc.total_height, 1);
     }
 
@@ -406,7 +367,6 @@ mod tests {
             content: vec![styled_span(text.trim(), bold)],
         }];
         let doc = flatten(&blocks, 40);
-        // Verify all lines have styled spans.
         for line in &doc.lines {
             if let DocumentLine::Text(l) = line {
                 for span in &l.spans {
@@ -417,5 +377,104 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_layout_repeated_text_no_misalignment() {
+        // Regression test: repeated text must not confuse the cursor.
+        let blocks = vec![RenderedBlock::Paragraph {
+            content: vec![plain_span("aaa bbb aaa bbb aaa bbb")],
+        }];
+        let doc = flatten(&blocks, 8);
+        // Collect all text from the wrapped lines.
+        let mut all_text = String::new();
+        for line in &doc.lines {
+            if let DocumentLine::Text(l) = line {
+                for span in &l.spans {
+                    all_text.push_str(&span.content);
+                }
+                all_text.push(' '); // represent line break as space
+            }
+        }
+        // All original words must appear (no duplication, no loss).
+        assert_eq!(all_text.matches("aaa").count(), 3, "word 'aaa' count");
+        assert_eq!(all_text.matches("bbb").count(), 3, "word 'bbb' count");
+    }
+
+    #[test]
+    fn test_layout_multi_style_spans_across_wrap() {
+        // Two styled spans that together exceed the width.
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let italic = Style::default().add_modifier(Modifier::ITALIC);
+        let blocks = vec![RenderedBlock::Paragraph {
+            content: vec![
+                styled_span("hello ", bold),
+                styled_span("world this is long", italic),
+            ],
+        }];
+        let doc = flatten(&blocks, 12);
+        assert!(doc.total_height >= 2, "should wrap");
+        // First line should have bold "hello " and italic "world"
+        if let DocumentLine::Text(first_line) = &doc.lines[0] {
+            assert!(!first_line.spans.is_empty(), "first line should have spans");
+        }
+    }
+
+    #[test]
+    fn test_layout_unicode_emoji_no_panic() {
+        let blocks = vec![RenderedBlock::Paragraph {
+            content: vec![plain_span("Hello 🌍 world 🎉 test 🚀 more text here for wrapping")],
+        }];
+        // Should not panic on emoji at any width.
+        let doc = flatten(&blocks, 15);
+        assert!(doc.total_height >= 1);
+    }
+
+    #[test]
+    fn test_layout_cjk_text_no_panic() {
+        let blocks = vec![RenderedBlock::Paragraph {
+            content: vec![plain_span("日本語のテキスト処理テスト")],
+        }];
+        let doc = flatten(&blocks, 10);
+        assert!(doc.total_height >= 1);
+    }
+
+    #[test]
+    fn test_layout_zero_width_no_panic() {
+        let blocks = vec![RenderedBlock::Paragraph {
+            content: vec![plain_span("text")],
+        }];
+        // Width 0 is clamped to 1 — should not panic.
+        let doc = flatten(&blocks, 0);
+        assert!(doc.total_height >= 1);
+    }
+
+    #[test]
+    fn test_layout_mixed_styles_content_preserved() {
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let code = Style::default().fg(Color::Indexed(252)).bg(Color::Indexed(236));
+        let blocks = vec![RenderedBlock::Paragraph {
+            content: vec![
+                styled_span("Use ", Style::default()),
+                styled_span("fmt", code),
+                styled_span(" for formatting output in your programs", bold),
+            ],
+        }];
+        let doc = flatten(&blocks, 20);
+        // Collect all text.
+        let mut all_text = String::new();
+        for line in &doc.lines {
+            if let DocumentLine::Text(l) = line {
+                for span in &l.spans {
+                    all_text.push_str(&span.content);
+                }
+            }
+        }
+        assert!(all_text.contains("Use "), "should contain 'Use '");
+        assert!(all_text.contains("fmt"), "should contain 'fmt'");
+        assert!(
+            all_text.contains("formatting"),
+            "should contain 'formatting'"
+        );
     }
 }

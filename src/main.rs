@@ -17,6 +17,7 @@ use ratatui::crossterm::event::{self, Event};
 
 use crate::app::App;
 use crate::cli::Cli;
+use crate::parser::RenderedBlock;
 
 fn main() -> color_eyre::Result<()> {
     // Install color_eyre error/panic hooks for pretty backtraces.
@@ -35,7 +36,7 @@ fn main() -> color_eyre::Result<()> {
     // Read the markdown source file.
     let source = fs::read_to_string(&cli.file)?;
 
-    // Parse markdown into IR blocks.
+    // Parse markdown into IR blocks (done once — blocks don't depend on width).
     let blocks = parser::parse(&source);
 
     // Get initial terminal size for layout.
@@ -51,7 +52,7 @@ fn main() -> color_eyre::Result<()> {
     let mut terminal = ratatui::init();
 
     // Main event loop.
-    let result = run_event_loop(&mut terminal, &mut app, &source);
+    let result = run_event_loop(&mut terminal, &mut app, &blocks);
 
     // Always restore the terminal, even if the loop returned an error.
     ratatui::restore();
@@ -62,11 +63,12 @@ fn main() -> color_eyre::Result<()> {
 /// Runs the TUI event loop until the user quits or an error occurs.
 ///
 /// Separated from `main()` so that `ratatui::restore()` always runs
-/// regardless of how this function exits.
+/// regardless of how this function exits. Takes a reference to the
+/// parsed blocks so resize can re-flatten without re-parsing.
 fn run_event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
-    source: &str,
+    blocks: &[RenderedBlock],
 ) -> color_eyre::Result<()> {
     loop {
         // Update viewport height from current terminal size.
@@ -83,9 +85,8 @@ fn run_event_loop(
                 app.handle_key(key);
             }
             Event::Resize(cols, _rows) => {
-                // Re-flatten the document at the new terminal width.
-                let blocks = parser::parse(source);
-                app.document = layout::flatten(&blocks, cols);
+                // Re-flatten at the new width (blocks are unchanged).
+                app.document = layout::flatten(blocks, cols);
                 // Clamp scroll offset to the new max.
                 let max = app.max_scroll();
                 if app.scroll_offset > max {

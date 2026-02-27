@@ -100,7 +100,8 @@ fn heading_level_to_u8(level: HeadingLevel) -> u8 {
 /// user markdown containing these features doesn't break — even though
 /// tables and lists aren't rendered until later phases.
 pub fn parse(source: &str) -> Vec<RenderedBlock> {
-    let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
+    let options =
+        Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
     let parser = Parser::new_ext(source, options);
 
     let mut blocks: Vec<RenderedBlock> = Vec::new();
@@ -109,14 +110,17 @@ pub fn parse(source: &str) -> Vec<RenderedBlock> {
     let mut current_spans: Vec<StyledSpan> = Vec::new();
 
     for event in parser {
-        let current_state = state_stack.last().expect("state stack must never be empty");
+        let Some(current_state) = state_stack.last() else {
+            // State stack underflow — stop parsing, return what we have.
+            debug_assert!(false, "parser state stack underflow");
+            break;
+        };
 
         // If we're skipping an unrecognized block, handle nesting depth.
         if let ParserState::Skipping { depth } = current_state {
             match event {
                 Event::Start(_) => {
                     let new_depth = depth + 1;
-                    // Pop old Skipping, push new with incremented depth
                     state_stack.pop();
                     state_stack.push(ParserState::Skipping { depth: new_depth });
                 }
@@ -129,7 +133,7 @@ pub fn parse(source: &str) -> Vec<RenderedBlock> {
                         state_stack.push(ParserState::Skipping { depth: new_depth });
                     }
                 }
-                // Consume all other events while skipping.
+                // Consume all other events while inside a skipped block.
                 _ => {}
             }
             continue;
@@ -153,7 +157,13 @@ pub fn parse(source: &str) -> Vec<RenderedBlock> {
                 style_stack.pop();
                 let level = match state_stack.pop() {
                     Some(ParserState::InHeading { level }) => level,
-                    _ => 1,
+                    other => {
+                        debug_assert!(
+                            false,
+                            "End(Heading) without InHeading state: got {other:?}"
+                        );
+                        1
+                    }
                 };
                 let content = std::mem::take(&mut current_spans);
                 blocks.push(RenderedBlock::Heading { level, content });
@@ -163,6 +173,15 @@ pub fn parse(source: &str) -> Vec<RenderedBlock> {
                 let content = std::mem::take(&mut current_spans);
                 blocks.push(RenderedBlock::Paragraph { content });
             }
+
+            // ── Inline tags: passthrough (process inner text normally) ──
+            // Links: ignore URL metadata, but inner Text events accumulate
+            // into the current block's spans so link text remains visible.
+            Event::Start(Tag::Link { .. }) => {}
+            Event::End(TagEnd::Link) => {}
+            // Images: same — show alt text inline.
+            Event::Start(Tag::Image { .. }) => {}
+            Event::End(TagEnd::Image) => {}
 
             // ── Inline formatting start ─────────────────────────────
             Event::Start(Tag::Emphasis) => {
@@ -219,16 +238,38 @@ pub fn parse(source: &str) -> Vec<RenderedBlock> {
             }
 
             // ── Unrecognized block-level start → skip gracefully ────
+            // Block-level tags not yet rendered (code blocks, lists,
+            // tables, block quotes, etc.) are skipped in Phase 1.
             Event::Start(_) => {
                 state_stack.push(ParserState::Skipping { depth: 0 });
             }
 
-            // ── All other events (End for skipped, TaskListMarker, etc.) ──
-            _ => {}
+            // ── Explicitly ignored events ───────────────────────────
+            // End events for tags we passthrough or skip.
+            Event::End(_) => {}
+            // Task list markers, footnote refs, inline HTML, etc.
+            Event::TaskListMarker(_)
+            | Event::FootnoteReference(_)
+            | Event::InlineHtml(_)
+            | Event::InlineMath(_)
+            | Event::DisplayMath(_)
+            | Event::Html(_) => {}
         }
     }
 
     blocks
+}
+
+/// Allows `ParserState` to be used in debug_assert messages.
+impl std::fmt::Debug for ParserState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParserState::TopLevel => write!(f, "TopLevel"),
+            ParserState::InHeading { level } => write!(f, "InHeading({level})"),
+            ParserState::InParagraph => write!(f, "InParagraph"),
+            ParserState::Skipping { depth } => write!(f, "Skipping({depth})"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -367,7 +408,6 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         match &blocks[0] {
             RenderedBlock::Paragraph { content } => {
-                // Text, SoftBreak(space), Text
                 assert_eq!(content.len(), 3);
                 assert_eq!(content[0].text, "line one");
                 assert_eq!(content[1].text, " ");
@@ -406,10 +446,64 @@ mod tests {
 
     #[test]
     fn test_parser_skips_unrecognized_blocks() {
-        // Code block is unrecognized in Phase 1 — should not panic.
         let md = "```rust\nfn main() {}\n```\n\nAfter code";
         let blocks = parse(md);
-        // Should have at least the paragraph after the code block.
-        assert!(blocks.iter().any(|b| matches!(b, RenderedBlock::Paragraph { .. })));
+        assert!(blocks
+            .iter()
+            .any(|b| matches!(b, RenderedBlock::Paragraph { .. })));
+    }
+
+    #[test]
+    fn test_parser_link_text_preserved() {
+        let blocks = parse("See [the docs](https://example.com) for details");
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            RenderedBlock::Paragraph { content } => {
+                let all_text: String = content.iter().map(|s| s.text.as_str()).collect();
+                assert!(
+                    all_text.contains("the docs"),
+                    "link text should be preserved, got: {all_text}"
+                );
+                assert!(
+                    all_text.contains("See"),
+                    "surrounding text preserved, got: {all_text}"
+                );
+                assert!(
+                    all_text.contains("for details"),
+                    "trailing text preserved, got: {all_text}"
+                );
+            }
+            _ => panic!("expected Paragraph block"),
+        }
+    }
+
+    #[test]
+    fn test_parser_image_alt_text_preserved() {
+        let blocks = parse("![alt text](image.png)");
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            RenderedBlock::Paragraph { content } => {
+                let all_text: String = content.iter().map(|s| s.text.as_str()).collect();
+                assert!(
+                    all_text.contains("alt text"),
+                    "image alt text should be preserved, got: {all_text}"
+                );
+            }
+            _ => panic!("expected Paragraph block"),
+        }
+    }
+
+    #[test]
+    fn test_parser_bold_inside_link() {
+        let blocks = parse("[**bold link**](url)");
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            RenderedBlock::Paragraph { content } => {
+                assert_eq!(content.len(), 1);
+                assert_eq!(content[0].text, "bold link");
+                assert!(content[0].style.add_modifier.contains(Modifier::BOLD));
+            }
+            _ => panic!("expected Paragraph block"),
+        }
     }
 }
