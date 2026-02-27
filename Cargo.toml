@@ -19,8 +19,8 @@ clap = { version = "4", features = ["derive"] }
 unicode-width = "0.2"
 textwrap = "0.16"
 color-eyre = "0.6"
-# Phase 2 (commented until needed)
-# syntect = "5.2"
+# Phase 2
+syntect = "5.2"
 # Phase 4 (commented until needed)
 # ratatui-image = { version = "10", default-features = false, features = ["image-defaults", "crossterm"] }
 # image = "0.25"

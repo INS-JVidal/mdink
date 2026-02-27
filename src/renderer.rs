@@ -12,6 +12,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
 use crate::layout::DocumentLine;
@@ -44,7 +45,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 break;
             }
 
-            let y = content_area.y + i as u16;
+            // saturating_add prevents u16 overflow if area.y is non-zero and i is large.
+            let y = content_area.y.saturating_add(i as u16);
             let line_area = Rect {
                 x: content_area.x,
                 y,
@@ -55,6 +57,30 @@ pub fn draw(frame: &mut Frame, app: &App) {
             match &app.document.lines[line_idx] {
                 DocumentLine::Text(line) => {
                     let paragraph = Paragraph::new(line.clone());
+                    frame.render_widget(paragraph, line_area);
+                }
+                DocumentLine::Code(line) => {
+                    let code_bg = Color::Indexed(235);
+                    // Override background on every span and add left padding.
+                    let mut spans = vec![Span::styled(" ", Style::default().bg(code_bg))];
+                    for span in &line.spans {
+                        let mut style = span.style;
+                        style.bg = Some(code_bg);
+                        spans.push(Span::styled(span.content.to_string(), style));
+                    }
+                    // Fill remaining width with background.
+                    // Use display width (columns), not byte length, to handle multi-byte
+                    // characters correctly (e.g. Unicode operators, CJK, arrows).
+                    let used: usize = spans.iter().map(|s| s.content.width()).sum();
+                    let remaining = (content_area.width as usize).saturating_sub(used);
+                    if remaining > 0 {
+                        spans.push(Span::styled(
+                            " ".repeat(remaining),
+                            Style::default().bg(code_bg),
+                        ));
+                    }
+                    let code_line = Line::from(spans);
+                    let paragraph = Paragraph::new(code_line);
                     frame.render_widget(paragraph, line_area);
                 }
                 DocumentLine::Empty => {

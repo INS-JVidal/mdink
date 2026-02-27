@@ -4,7 +4,7 @@
 //! the block-level IR from the parser and produces a flat sequence of
 //! `DocumentLine`s sized to fit a given terminal width.
 
-use ratatui::style::Style;
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::parser::{RenderedBlock, StyledSpan};
@@ -26,6 +26,8 @@ pub struct PreRenderedDocument {
 pub enum DocumentLine {
     /// A line of styled text (paragraph, heading, etc.).
     Text(Line<'static>),
+    /// A line of syntax-highlighted code (no wrapping).
+    Code(Line<'static>),
     /// An empty line used for inter-block spacing.
     Empty,
     /// A horizontal rule spanning the terminal width.
@@ -67,6 +69,26 @@ pub fn flatten(blocks: &[RenderedBlock], width: u16) -> PreRenderedDocument {
                     for line in wrapped {
                         lines.push(DocumentLine::Text(line));
                     }
+                }
+            }
+            RenderedBlock::CodeBlock {
+                language,
+                highlighted_lines,
+            } => {
+                // Emit language label header if language is specified.
+                if !language.is_empty() {
+                    let label = Span::styled(
+                        format!(" {language} "),
+                        Style::default()
+                            .fg(Color::Indexed(245))
+                            .bg(Color::Indexed(235))
+                            .add_modifier(Modifier::ITALIC),
+                    );
+                    lines.push(DocumentLine::Code(Line::from(label)));
+                }
+                // Emit each highlighted line (no wrapping — code is literal).
+                for line in highlighted_lines {
+                    lines.push(DocumentLine::Code(line.clone()));
                 }
             }
             RenderedBlock::ThematicBreak => {
@@ -130,10 +152,12 @@ fn wrap_styled_spans(spans: &[StyledSpan], width: usize) -> Vec<Line<'static>> {
     let mut cursor: usize = 0;
 
     for wrapped_text in &wrapped_lines {
+        let wrapped_str: &str = wrapped_text.as_ref();
+
         // Skip whitespace between wrapped lines (break points consumed by textwrap).
         // Only advance forward — the cursor never goes backward.
         while cursor < plain.len() {
-            if plain[cursor..].starts_with(wrapped_text.as_ref()) {
+            if plain[cursor..].starts_with(wrapped_str) {
                 break;
             }
             // Advance by one character (not one byte) to stay on char boundaries.
@@ -145,10 +169,28 @@ fn wrap_styled_spans(spans: &[StyledSpan], width: usize) -> Vec<Line<'static>> {
             cursor += ch_len;
         }
 
+        // Guard: if cursor exhausted `plain` without finding this line, textwrap
+        // returned a `Cow::Owned` string with modified content (e.g. soft hyphen
+        // stripped by UnicodeBreakProperties). Emitting built_spans_for_range would
+        // either produce empty spans (silent data loss) or slice on a non-char
+        // boundary (panic). Fall back to emitting the wrapped text directly instead.
+        if cursor >= plain.len() && !plain.ends_with(wrapped_str) {
+            result.push(Line::from(Span::raw(wrapped_str.to_string())));
+            continue;
+        }
+
         let line_start = cursor;
-        let line_end = cursor + wrapped_text.len();
+        let line_end = cursor + wrapped_str.len();
         // Clamp to plain text length for safety.
         let line_end = line_end.min(plain.len());
+
+        // Verify the end is on a char boundary before slicing. If not (can only
+        // happen with Cow::Owned from textwrap), emit the text directly.
+        if !plain.is_char_boundary(line_end) {
+            result.push(Line::from(Span::raw(wrapped_str.to_string())));
+            cursor = line_end.min(plain.len());
+            continue;
+        }
 
         let line_spans = build_spans_for_range(&plain, &byte_styles, line_start, line_end);
         result.push(Line::from(line_spans));
@@ -476,5 +518,80 @@ mod tests {
             all_text.contains("formatting"),
             "should contain 'formatting'"
         );
+    }
+
+    // ── Phase 2: Code block layout tests ────────────────────────
+
+    fn make_code_line(text: &str) -> Line<'static> {
+        Line::from(Span::raw(text.to_string()))
+    }
+
+    #[test]
+    fn test_layout_code_block_long_line_no_wrap() {
+        let long_line = "x".repeat(200);
+        let blocks = vec![RenderedBlock::CodeBlock {
+            language: String::new(),
+            highlighted_lines: vec![make_code_line(&long_line)],
+        }];
+        let doc = flatten(&blocks, 40);
+        // Code lines should NOT wrap — still 1 Code line.
+        let code_count = doc
+            .lines
+            .iter()
+            .filter(|l| matches!(l, DocumentLine::Code(_)))
+            .count();
+        assert_eq!(code_count, 1, "code should not wrap");
+    }
+
+    #[test]
+    fn test_layout_code_block_empty_language_no_label() {
+        let blocks = vec![RenderedBlock::CodeBlock {
+            language: String::new(),
+            highlighted_lines: vec![make_code_line("code")],
+        }];
+        let doc = flatten(&blocks, 80);
+        // No language → no label line, just the code line.
+        assert_eq!(doc.total_height, 1);
+    }
+
+    #[test]
+    fn test_layout_code_block_with_language_has_label() {
+        let blocks = vec![RenderedBlock::CodeBlock {
+            language: "rust".to_string(),
+            highlighted_lines: vec![
+                make_code_line("fn main() {"),
+                make_code_line("    println!(\"hello\");"),
+                make_code_line("}"),
+            ],
+        }];
+        let doc = flatten(&blocks, 80);
+        // 1 label + 3 code lines = 4
+        assert_eq!(doc.total_height, 4);
+        // First line should be the label.
+        if let DocumentLine::Code(label_line) = &doc.lines[0] {
+            let text: String = label_line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(text.contains("rust"), "label should contain language name");
+        } else {
+            panic!("expected Code line for label");
+        }
+    }
+
+    #[test]
+    fn test_layout_code_block_multiple_lines_correct_count() {
+        let blocks = vec![RenderedBlock::CodeBlock {
+            language: "python".to_string(),
+            highlighted_lines: vec![
+                make_code_line("def f():"),
+                make_code_line("    pass"),
+            ],
+        }];
+        let doc = flatten(&blocks, 80);
+        // 1 label + 2 code lines = 3
+        let code_count = doc
+            .lines
+            .iter()
+            .filter(|l| matches!(l, DocumentLine::Code(_)))
+            .count();
+        assert_eq!(code_count, 3);
     }
 }

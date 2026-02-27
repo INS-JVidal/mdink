@@ -83,7 +83,9 @@ impl App {
     /// Scrolls down by `n` lines, clamped to the maximum scroll position.
     pub fn scroll_down(&mut self, n: usize) {
         let max = self.max_scroll();
-        self.scroll_offset = (self.scroll_offset + n).min(max);
+        // Use saturating_add so overflow before .min() cannot wrap to a small value.
+        // (scroll_up already uses saturating_sub symmetrically.)
+        self.scroll_offset = self.scroll_offset.saturating_add(n).min(max);
     }
 
     /// Scrolls up by `n` lines, clamped to 0.
