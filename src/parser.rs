@@ -109,236 +109,175 @@ fn heading_level_to_u8(level: HeadingLevel) -> u8 {
     }
 }
 
-/// Parses a markdown source string into the RenderedBlock IR.
+// ── ParseContext ─────────────────────────────────────────────────────────────
+
+/// Accumulates all mutable parser state across a single `parse()` call.
 ///
-/// Enables GFM extensions (strikethrough, tables, tasklists) so that
-/// user markdown containing these features doesn't break — even though
-/// tables and lists aren't rendered until later phases.
-pub fn parse(source: &str, highlighter: &crate::highlight::Highlighter) -> Vec<RenderedBlock> {
-    let options =
-        Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
-    let parser = Parser::new_ext(source, options);
+/// Exists solely as an implementation detail of `parse()` — it is created
+/// in `ParseContext::new`, driven by `process()`, and consumed to return
+/// the final `Vec<RenderedBlock>`. Not part of the public API.
+struct ParseContext<'a> {
+    highlighter: &'a crate::highlight::Highlighter,
+    blocks: Vec<RenderedBlock>,
+    /// Block-level state machine (never empty while parsing).
+    state_stack: Vec<ParserState>,
+    /// Inline formatting modifier stack (push on Start, pop on End).
+    style_stack: Vec<Style>,
+    /// Spans accumulated for the block currently being built.
+    current_spans: Vec<StyledSpan>,
+}
 
-    let mut blocks: Vec<RenderedBlock> = Vec::new();
-    let mut state_stack: Vec<ParserState> = vec![ParserState::TopLevel];
-    let mut style_stack: Vec<Style> = Vec::new();
-    let mut current_spans: Vec<StyledSpan> = Vec::new();
+impl<'a> ParseContext<'a> {
+    fn new(highlighter: &'a crate::highlight::Highlighter) -> Self {
+        Self {
+            highlighter,
+            blocks: Vec::new(),
+            state_stack: vec![ParserState::TopLevel],
+            style_stack: Vec::new(),
+            current_spans: Vec::new(),
+        }
+    }
 
-    for event in parser {
-        // If inside a code block, accumulate text into the buffer.
-        // This is checked first (before other state checks) with its own scope
-        // to avoid overlapping borrows on `state_stack`.
-        if matches!(state_stack.last(), Some(ParserState::InCodeBlock { .. })) {
-            match event {
-                Event::Text(text) => {
-                    let Some(ParserState::InCodeBlock { buffer, .. }) =
-                        state_stack.last_mut()
-                    else {
-                        unreachable!();
-                    };
-                    buffer.push_str(&text);
-                    continue;
-                }
-                Event::End(TagEnd::CodeBlock) => {
-                    let Some(ParserState::InCodeBlock { language, buffer }) = state_stack.pop()
-                    else {
-                        unreachable!();
-                    };
-                    let highlighted_lines =
-                        highlighter.highlight_code(&buffer, &language, "base16-ocean.dark");
-                    blocks.push(RenderedBlock::CodeBlock {
-                        language,
-                        highlighted_lines,
-                    });
-                    continue;
-                }
-                // Ignore other events inside code blocks.
-                _ => {
-                    continue;
-                }
+    /// Drives the pulldown-cmark event stream and returns the finished blocks.
+    fn process(mut self, source: &str) -> Vec<RenderedBlock> {
+        let options =
+            Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
+
+        for event in Parser::new_ext(source, options) {
+            if self.state_stack.is_empty() {
+                // State stack underflow — parser invariant violated. Stop here
+                // rather than panic so partially-parsed output is still returned.
+                debug_assert!(false, "parser state stack underflow");
+                break;
             }
+            self.on_event(event);
         }
 
-        let Some(current_state) = state_stack.last() else {
-            // State stack underflow — stop parsing, return what we have.
-            debug_assert!(false, "parser state stack underflow");
-            break;
-        };
+        self.blocks
+    }
 
-        // If we're skipping an unrecognized block, handle nesting depth.
-        if let ParserState::Skipping { depth } = current_state {
-            match event {
-                Event::Start(_) => {
-                    let new_depth = depth + 1;
-                    state_stack.pop();
-                    state_stack.push(ParserState::Skipping { depth: new_depth });
-                }
-                Event::End(_) => {
-                    if *depth == 0 {
-                        state_stack.pop();
-                    } else {
-                        let new_depth = depth - 1;
-                        state_stack.pop();
-                        state_stack.push(ParserState::Skipping { depth: new_depth });
-                    }
-                }
-                // Consume all other events while inside a skipped block.
-                _ => {}
-            }
-            continue;
+    // ── Event routing ────────────────────────────────────────────────────────
+
+    /// Routes each event to the appropriate handler based on current state.
+    fn on_event(&mut self, event: Event) {
+        if matches!(self.state_stack.last(), Some(ParserState::InCodeBlock { .. })) {
+            self.on_code_block_event(event);
+        } else if matches!(self.state_stack.last(), Some(ParserState::Skipping { .. })) {
+            self.on_skipping_event(event);
+        } else {
+            self.dispatch(event);
         }
+    }
 
+    /// Handles events when inside a fenced/indented code block.
+    ///
+    /// Accumulates text into the buffer; on `End(CodeBlock)` runs syntax
+    /// highlighting and emits the finished `CodeBlock` block.
+    fn on_code_block_event(&mut self, event: Event) {
         match event {
-            // ── Block-level start events ────────────────────────────
-            Event::Start(Tag::Heading { level, .. }) => {
-                let lvl = heading_level_to_u8(level);
-                style_stack.push(default_heading_style(lvl));
-                current_spans.clear();
-                state_stack.push(ParserState::InHeading { level: lvl });
+            Event::Text(text) => {
+                if let Some(ParserState::InCodeBlock { buffer, .. }) =
+                    self.state_stack.last_mut()
+                {
+                    buffer.push_str(&text);
+                }
             }
-            Event::Start(Tag::Paragraph) => {
-                current_spans.clear();
-                state_stack.push(ParserState::InParagraph);
+            Event::End(TagEnd::CodeBlock) => {
+                if let Some(ParserState::InCodeBlock { language, buffer }) =
+                    self.state_stack.pop()
+                {
+                    let highlighted_lines = self.highlighter.highlight_code(
+                        &buffer,
+                        &language,
+                        "base16-ocean.dark",
+                    );
+                    self.blocks
+                        .push(RenderedBlock::CodeBlock { language, highlighted_lines });
+                }
             }
+            // Ignore all other events (syntax, meta) inside a code block.
+            _ => {}
+        }
+    }
 
-            // ── Block-level end events ──────────────────────────────
-            Event::End(TagEnd::Heading(_)) => {
-                // Pop state first, then pop style only on the confirmed InHeading path.
-                // Previously style_stack.pop() ran unconditionally before the state check,
-                // which would corrupt style_stack in the error path by removing a style that
-                // belonged to an active emphasis or link, not a heading.
-                let level = match state_stack.pop() {
-                    Some(ParserState::InHeading { level }) => {
-                        style_stack.pop();
-                        level
-                    }
-                    other => {
-                        debug_assert!(
-                            false,
-                            "End(Heading) without InHeading state: got {other:?}"
-                        );
-                        1
-                    }
-                };
-                let content = std::mem::take(&mut current_spans);
-                blocks.push(RenderedBlock::Heading { level, content });
+    /// Handles events when inside an unrecognized block being skipped.
+    ///
+    /// Tracks nesting depth via `Skipping { depth }` so that nested
+    /// unrecognized blocks don't prematurely end the skip.
+    fn on_skipping_event(&mut self, event: Event) {
+        // Copy depth out to release the shared borrow before mutation below.
+        let depth = match self.state_stack.last() {
+            Some(ParserState::Skipping { depth }) => *depth,
+            _ => return,
+        };
+        match event {
+            Event::Start(_) => {
+                self.state_stack.pop();
+                self.state_stack.push(ParserState::Skipping { depth: depth + 1 });
             }
-            Event::End(TagEnd::Paragraph) => {
-                state_stack.pop();
-                let content = std::mem::take(&mut current_spans);
-                blocks.push(RenderedBlock::Paragraph { content });
+            Event::End(_) if depth == 0 => {
+                self.state_stack.pop();
             }
+            Event::End(_) => {
+                self.state_stack.pop();
+                self.state_stack.push(ParserState::Skipping { depth: depth - 1 });
+            }
+            _ => {}
+        }
+    }
 
-            // ── Inline tags: passthrough (process inner text normally) ──
-            // Links: ignore URL metadata, but inner Text events accumulate
-            // into the current block's spans so link text remains visible.
+    /// Dispatches normal (non-code-block, non-skipping) events.
+    fn dispatch(&mut self, event: Event) {
+        match event {
+            // ── Block-level start ────────────────────────────────────
+            Event::Start(Tag::Heading { level, .. }) => self.start_heading(level),
+            Event::Start(Tag::Paragraph) => self.start_paragraph(),
+            Event::Start(Tag::CodeBlock(kind)) => self.start_code_block(kind),
+
+            // ── Inline passthrough ───────────────────────────────────
+            // Links: render text in the italic font slot; URL is ignored.
             Event::Start(Tag::Link { .. }) => {
-                style_stack.push(Style::default().add_modifier(Modifier::ITALIC));
+                self.push_style(Style::default().add_modifier(Modifier::ITALIC));
             }
-            Event::End(TagEnd::Link) => {
-                debug_assert!(!style_stack.is_empty(), "End(Link) with empty style_stack");
-                style_stack.pop();
-            }
-            // Images: show alt text inline (no style push — images are
-            // unstyled passthrough, unlike links which get ITALIC).
+            // Images: show alt text unstyled (no style push).
             Event::Start(Tag::Image { .. }) => {}
-            Event::End(TagEnd::Image) => {}
 
-            // ── Inline formatting start ─────────────────────────────
+            // ── Inline formatting ────────────────────────────────────
             Event::Start(Tag::Emphasis) => {
-                style_stack.push(Style::default().add_modifier(Modifier::ITALIC));
+                self.push_style(Style::default().add_modifier(Modifier::ITALIC));
             }
             Event::Start(Tag::Strong) => {
-                style_stack.push(Style::default().add_modifier(Modifier::BOLD));
+                self.push_style(Style::default().add_modifier(Modifier::BOLD));
             }
             Event::Start(Tag::Strikethrough) => {
-                style_stack.push(Style::default().add_modifier(Modifier::CROSSED_OUT));
+                self.push_style(Style::default().add_modifier(Modifier::CROSSED_OUT));
             }
 
-            // ── Inline formatting end ───────────────────────────────
+            // Any unrecognized block tag — skip until its matching End.
+            // MUST be last among Start arms so it doesn't shadow specific variants above.
+            Event::Start(_) => self.state_stack.push(ParserState::Skipping { depth: 0 }),
+
+            // ── Block-level end ──────────────────────────────────────
+            Event::End(TagEnd::Heading(_)) => self.end_heading(),
+            Event::End(TagEnd::Paragraph) => self.end_paragraph(),
+
+            // ── Inline end ───────────────────────────────────────────
+            Event::End(TagEnd::Link) => self.pop_style(),
+            Event::End(TagEnd::Image) => {}
             Event::End(TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough) => {
-                debug_assert!(
-                    !style_stack.is_empty(),
-                    "End(inline format) with empty style_stack"
-                );
-                style_stack.pop();
+                self.pop_style();
             }
 
-            // ── Text content ────────────────────────────────────────
-            Event::Text(text) => {
-                let style = effective_style(&style_stack);
-                current_spans.push(StyledSpan {
-                    text: text.to_string(),
-                    style,
-                });
-            }
+            // ── Text content ─────────────────────────────────────────
+            Event::Text(text) => self.push_text(&text),
+            Event::Code(text) => self.push_inline_code(&text),
+            Event::SoftBreak => self.push_soft_break(),
+            Event::HardBreak => self.push_hard_break(),
+            Event::Rule => self.blocks.push(RenderedBlock::ThematicBreak),
 
-            // ── Inline code ─────────────────────────────────────────
-            Event::Code(text) => {
-                current_spans.push(StyledSpan {
-                    text: text.to_string(),
-                    style: default_code_style(),
-                });
-            }
-
-            // ── Breaks ──────────────────────────────────────────────
-            Event::SoftBreak => {
-                let style = effective_style(&style_stack);
-                current_spans.push(StyledSpan {
-                    text: " ".to_string(),
-                    style,
-                });
-            }
-            Event::HardBreak => {
-                let style = effective_style(&style_stack);
-                current_spans.push(StyledSpan {
-                    text: "\n".to_string(),
-                    style,
-                });
-            }
-
-            // ── Thematic break (horizontal rule) ────────────────────
-            Event::Rule => {
-                blocks.push(RenderedBlock::ThematicBreak);
-            }
-
-            // ── Code block start ──────────────────────────────────
-            Event::Start(Tag::CodeBlock(kind)) => {
-                let language = match kind {
-                    // pulldown-cmark yields the full info string (e.g. "rust,no_run" or
-                    // "python title=\"x.py\""). Take only the first whitespace-delimited
-                    // token so syntect lookup and the label display get the bare language name.
-                    CodeBlockKind::Fenced(lang) => {
-                        // Take the bare language token, stripping both whitespace-separated
-                        // attributes (GFM: "python title=\"x.py\"") and comma-separated
-                        // modifiers (rustdoc: "rust,no_run", "rust,ignore").
-                        lang.split_whitespace()
-                            .next()
-                            .unwrap_or("")
-                            .split(',')
-                            .next()
-                            .unwrap_or("")
-                            .to_string()
-                    }
-                    CodeBlockKind::Indented => String::new(),
-                };
-                state_stack.push(ParserState::InCodeBlock {
-                    language,
-                    buffer: String::new(),
-                });
-            }
-
-            // ── Unrecognized block-level start → skip gracefully ────
-            // Block-level tags not yet rendered (lists, tables, block
-            // quotes, etc.) are skipped until later phases.
-            Event::Start(_) => {
-                state_stack.push(ParserState::Skipping { depth: 0 });
-            }
-
-            // ── Explicitly ignored events ───────────────────────────
-            // End events for tags we passthrough or skip.
+            // ── Ignored ──────────────────────────────────────────────
+            // End events for passthrough/skipped tags have no handler.
             Event::End(_) => {}
-            // Task list markers, footnote refs, inline HTML, etc.
             Event::TaskListMarker(_)
             | Event::FootnoteReference(_)
             | Event::InlineHtml(_)
@@ -348,7 +287,108 @@ pub fn parse(source: &str, highlighter: &crate::highlight::Highlighter) -> Vec<R
         }
     }
 
-    blocks
+    // ── Block handlers ───────────────────────────────────────────────────────
+
+    fn start_heading(&mut self, level: HeadingLevel) {
+        let lvl = heading_level_to_u8(level);
+        self.style_stack.push(default_heading_style(lvl));
+        self.current_spans.clear();
+        self.state_stack.push(ParserState::InHeading { level: lvl });
+    }
+
+    fn end_heading(&mut self) {
+        // Pop state first; only pop style if state confirms we were in a heading.
+        // This prevents corrupting the style stack on malformed event sequences.
+        let level = match self.state_stack.pop() {
+            Some(ParserState::InHeading { level }) => {
+                self.style_stack.pop();
+                level
+            }
+            other => {
+                debug_assert!(
+                    false,
+                    "End(Heading) without InHeading state: got {other:?}"
+                );
+                1
+            }
+        };
+        let content = std::mem::take(&mut self.current_spans);
+        self.blocks.push(RenderedBlock::Heading { level, content });
+    }
+
+    fn start_paragraph(&mut self) {
+        self.current_spans.clear();
+        self.state_stack.push(ParserState::InParagraph);
+    }
+
+    fn end_paragraph(&mut self) {
+        self.state_stack.pop();
+        let content = std::mem::take(&mut self.current_spans);
+        self.blocks.push(RenderedBlock::Paragraph { content });
+    }
+
+    fn start_code_block(&mut self, kind: CodeBlockKind) {
+        let language = match kind {
+            // pulldown-cmark yields the full info string (e.g. "rust,no_run" or
+            // "python title=\"x.py\""). Take only the first whitespace-delimited
+            // token so syntect lookup and the label display get the bare language name.
+            CodeBlockKind::Fenced(lang) => lang
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .split(',')
+                .next()
+                .unwrap_or("")
+                .to_string(),
+            CodeBlockKind::Indented => String::new(),
+        };
+        self.state_stack
+            .push(ParserState::InCodeBlock { language, buffer: String::new() });
+    }
+
+    // ── Style stack helpers ──────────────────────────────────────────────────
+
+    fn push_style(&mut self, style: Style) {
+        self.style_stack.push(style);
+    }
+
+    fn pop_style(&mut self) {
+        debug_assert!(!self.style_stack.is_empty(), "pop_style on empty style_stack");
+        self.style_stack.pop();
+    }
+
+    // ── Span builders ────────────────────────────────────────────────────────
+
+    fn push_text(&mut self, text: &str) {
+        let style = effective_style(&self.style_stack);
+        self.current_spans.push(StyledSpan { text: text.to_string(), style });
+    }
+
+    fn push_inline_code(&mut self, text: &str) {
+        self.current_spans
+            .push(StyledSpan { text: text.to_string(), style: default_code_style() });
+    }
+
+    fn push_soft_break(&mut self) {
+        let style = effective_style(&self.style_stack);
+        self.current_spans.push(StyledSpan { text: " ".to_string(), style });
+    }
+
+    fn push_hard_break(&mut self) {
+        let style = effective_style(&self.style_stack);
+        self.current_spans.push(StyledSpan { text: "\n".to_string(), style });
+    }
+}
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+/// Parses a markdown source string into the RenderedBlock IR.
+///
+/// Enables GFM extensions (strikethrough, tables, tasklists) so that
+/// user markdown containing these features doesn't break — even though
+/// tables and lists aren't rendered until later phases.
+pub fn parse(source: &str, highlighter: &crate::highlight::Highlighter) -> Vec<RenderedBlock> {
+    ParseContext::new(highlighter).process(source)
 }
 
 /// Allows `ParserState` to be used in debug_assert messages.
@@ -367,466 +407,5 @@ impl std::fmt::Debug for ParserState {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::LazyLock;
-
-    static TEST_HIGHLIGHTER: LazyLock<crate::highlight::Highlighter> =
-        LazyLock::new(crate::highlight::Highlighter::new);
-
-    fn h() -> &'static crate::highlight::Highlighter {
-        &TEST_HIGHLIGHTER
-    }
-
-    #[test]
-    fn test_parser_heading_h1_produces_heading_block() {
-        let blocks = parse("# Hello", h());
-        assert_eq!(blocks.len(), 1);
-        match &blocks[0] {
-            RenderedBlock::Heading { level, content } => {
-                assert_eq!(*level, 1);
-                assert_eq!(content.len(), 1);
-                assert_eq!(content[0].text, "Hello");
-            }
-            _ => panic!("expected Heading block"),
-        }
-    }
-
-    #[test]
-    fn test_parser_heading_all_levels() {
-        for lvl in 1..=6 {
-            let md = format!("{} Level {}", "#".repeat(lvl), lvl);
-            let blocks = parse(&md, h());
-            assert_eq!(blocks.len(), 1, "level {lvl}");
-            match &blocks[0] {
-                RenderedBlock::Heading { level, .. } => {
-                    assert_eq!(*level, lvl as u8, "level {lvl}");
-                }
-                _ => panic!("expected Heading at level {lvl}"),
-            }
-        }
-    }
-
-    #[test]
-    fn test_parser_paragraph_plain_text() {
-        let blocks = parse("Hello world", h());
-        assert_eq!(blocks.len(), 1);
-        match &blocks[0] {
-            RenderedBlock::Paragraph { content } => {
-                assert_eq!(content.len(), 1);
-                assert_eq!(content[0].text, "Hello world");
-            }
-            _ => panic!("expected Paragraph block"),
-        }
-    }
-
-    #[test]
-    fn test_parser_bold_text() {
-        let blocks = parse("**bold**", h());
-        assert_eq!(blocks.len(), 1);
-        match &blocks[0] {
-            RenderedBlock::Paragraph { content } => {
-                assert_eq!(content.len(), 1);
-                assert_eq!(content[0].text, "bold");
-                assert!(content[0].style.add_modifier.contains(Modifier::BOLD));
-            }
-            _ => panic!("expected Paragraph block"),
-        }
-    }
-
-    #[test]
-    fn test_parser_italic_text() {
-        let blocks = parse("*italic*", h());
-        assert_eq!(blocks.len(), 1);
-        match &blocks[0] {
-            RenderedBlock::Paragraph { content } => {
-                assert_eq!(content.len(), 1);
-                assert_eq!(content[0].text, "italic");
-                assert!(content[0].style.add_modifier.contains(Modifier::ITALIC));
-            }
-            _ => panic!("expected Paragraph block"),
-        }
-    }
-
-    #[test]
-    fn test_parser_strikethrough_text() {
-        let blocks = parse("~~struck~~", h());
-        assert_eq!(blocks.len(), 1);
-        match &blocks[0] {
-            RenderedBlock::Paragraph { content } => {
-                assert_eq!(content.len(), 1);
-                assert_eq!(content[0].text, "struck");
-                assert!(content[0]
-                    .style
-                    .add_modifier
-                    .contains(Modifier::CROSSED_OUT));
-            }
-            _ => panic!("expected Paragraph block"),
-        }
-    }
-
-    #[test]
-    fn test_parser_nested_bold_italic() {
-        let blocks = parse("***bold italic***", h());
-        assert_eq!(blocks.len(), 1);
-        match &blocks[0] {
-            RenderedBlock::Paragraph { content } => {
-                assert_eq!(content.len(), 1);
-                assert_eq!(content[0].text, "bold italic");
-                let mods = content[0].style.add_modifier;
-                assert!(mods.contains(Modifier::BOLD));
-                assert!(mods.contains(Modifier::ITALIC));
-            }
-            _ => panic!("expected Paragraph block"),
-        }
-    }
-
-    #[test]
-    fn test_parser_inline_code() {
-        let blocks = parse("Use `fmt` here", h());
-        assert_eq!(blocks.len(), 1);
-        match &blocks[0] {
-            RenderedBlock::Paragraph { content } => {
-                assert_eq!(content.len(), 3);
-                assert_eq!(content[0].text, "Use ");
-                assert_eq!(content[1].text, "fmt");
-                assert_eq!(content[1].style, default_code_style());
-                assert_eq!(content[2].text, " here");
-            }
-            _ => panic!("expected Paragraph block"),
-        }
-    }
-
-    #[test]
-    fn test_parser_thematic_break() {
-        let blocks = parse("---", h());
-        assert_eq!(blocks.len(), 1);
-        assert!(matches!(&blocks[0], RenderedBlock::ThematicBreak));
-    }
-
-    #[test]
-    fn test_parser_soft_break() {
-        let blocks = parse("line one\nline two", h());
-        assert_eq!(blocks.len(), 1);
-        match &blocks[0] {
-            RenderedBlock::Paragraph { content } => {
-                assert_eq!(content.len(), 3);
-                assert_eq!(content[0].text, "line one");
-                assert_eq!(content[1].text, " ");
-                assert_eq!(content[2].text, "line two");
-            }
-            _ => panic!("expected Paragraph block"),
-        }
-    }
-
-    #[test]
-    fn test_parser_hard_break() {
-        let blocks = parse("line one\\\nline two", h());
-        assert_eq!(blocks.len(), 1);
-        match &blocks[0] {
-            RenderedBlock::Paragraph { content } => {
-                assert!(content.iter().any(|s| s.text == "\n"));
-            }
-            _ => panic!("expected Paragraph block"),
-        }
-    }
-
-    #[test]
-    fn test_parser_empty_input() {
-        let blocks = parse("", h());
-        assert!(blocks.is_empty());
-    }
-
-    #[test]
-    fn test_parser_heading_styles_are_distinct() {
-        let s1 = default_heading_style(1);
-        let s2 = default_heading_style(2);
-        let s3 = default_heading_style(3);
-        assert_ne!(s1.fg, s2.fg);
-        assert_ne!(s2.fg, s3.fg);
-    }
-
-    #[test]
-    fn test_parser_skips_unrecognized_blocks() {
-        // Use a list (not code block) since code blocks are now handled.
-        let md = "- item one\n- item two\n\nAfter list";
-        let blocks = parse(md, h());
-        assert!(blocks
-            .iter()
-            .any(|b| matches!(b, RenderedBlock::Paragraph { .. })));
-    }
-
-    #[test]
-    fn test_parser_link_text_preserved() {
-        let blocks = parse("See [the docs](https://example.com) for details", h());
-        assert_eq!(blocks.len(), 1);
-        match &blocks[0] {
-            RenderedBlock::Paragraph { content } => {
-                let all_text: String = content.iter().map(|s| s.text.as_str()).collect();
-                assert!(
-                    all_text.contains("the docs"),
-                    "link text should be preserved, got: {all_text}"
-                );
-                assert!(
-                    all_text.contains("See"),
-                    "surrounding text preserved, got: {all_text}"
-                );
-                assert!(
-                    all_text.contains("for details"),
-                    "trailing text preserved, got: {all_text}"
-                );
-            }
-            _ => panic!("expected Paragraph block"),
-        }
-    }
-
-    #[test]
-    fn test_parser_image_alt_text_preserved() {
-        let blocks = parse("![alt text](image.png)", h());
-        assert_eq!(blocks.len(), 1);
-        match &blocks[0] {
-            RenderedBlock::Paragraph { content } => {
-                let all_text: String = content.iter().map(|s| s.text.as_str()).collect();
-                assert!(
-                    all_text.contains("alt text"),
-                    "image alt text should be preserved, got: {all_text}"
-                );
-            }
-            _ => panic!("expected Paragraph block"),
-        }
-    }
-
-    #[test]
-    fn test_parser_bold_inside_link() {
-        let blocks = parse("[**bold link**](url)", h());
-        assert_eq!(blocks.len(), 1);
-        match &blocks[0] {
-            RenderedBlock::Paragraph { content } => {
-                assert_eq!(content.len(), 1);
-                assert_eq!(content[0].text, "bold link");
-                assert!(content[0].style.add_modifier.contains(Modifier::BOLD));
-            }
-            _ => panic!("expected Paragraph block"),
-        }
-    }
-
-    // ── Phase 2: Code block tests ───────────────────────────────
-
-    #[test]
-    fn test_parser_fenced_code_block_with_language() {
-        let md = "```rust\nfn main() {}\n```";
-        let blocks = parse(md, h());
-        assert_eq!(blocks.len(), 1);
-        match &blocks[0] {
-            RenderedBlock::CodeBlock {
-                language,
-                highlighted_lines,
-            } => {
-                assert_eq!(language, "rust");
-                assert!(!highlighted_lines.is_empty());
-            }
-            _ => panic!("expected CodeBlock"),
-        }
-    }
-
-    #[test]
-    fn test_parser_fenced_code_block_empty_language() {
-        let md = "```\nsome code\n```";
-        let blocks = parse(md, h());
-        assert_eq!(blocks.len(), 1);
-        match &blocks[0] {
-            RenderedBlock::CodeBlock { language, .. } => {
-                assert!(language.is_empty());
-            }
-            _ => panic!("expected CodeBlock"),
-        }
-    }
-
-    #[test]
-    fn test_parser_indented_code_block() {
-        let md = "    indented code\n    more code\n";
-        let blocks = parse(md, h());
-        assert!(
-            blocks.iter().any(|b| matches!(b, RenderedBlock::CodeBlock { .. })),
-            "indented code should produce CodeBlock"
-        );
-    }
-
-    #[test]
-    fn test_parser_inline_code_still_styled_span() {
-        let blocks = parse("Use `code` inline", h());
-        assert_eq!(blocks.len(), 1);
-        match &blocks[0] {
-            RenderedBlock::Paragraph { content } => {
-                assert!(content.iter().any(|s| s.text == "code"));
-            }
-            _ => panic!("expected Paragraph, not CodeBlock"),
-        }
-    }
-
-    #[test]
-    fn test_parser_code_block_content_preserved() {
-        let md = "```python\ndef hello():\n    print(\"world\")\n```";
-        let blocks = parse(md, h());
-        assert_eq!(blocks.len(), 1);
-        match &blocks[0] {
-            RenderedBlock::CodeBlock {
-                highlighted_lines, ..
-            } => {
-                let all_text: String = highlighted_lines
-                    .iter()
-                    .flat_map(|line| line.spans.iter())
-                    .map(|span| span.content.as_ref())
-                    .collect();
-                assert!(all_text.contains("def"), "should contain 'def'");
-                assert!(all_text.contains("hello"), "should contain 'hello'");
-                assert!(all_text.contains("print"), "should contain 'print'");
-            }
-            _ => panic!("expected CodeBlock"),
-        }
-    }
-
-    #[test]
-    fn test_parser_code_block_followed_by_paragraph() {
-        let md = "```rust\ncode\n```\n\nAfter code";
-        let blocks = parse(md, h());
-        assert_eq!(blocks.len(), 2);
-        assert!(matches!(&blocks[0], RenderedBlock::CodeBlock { .. }));
-        assert!(matches!(&blocks[1], RenderedBlock::Paragraph { .. }));
-    }
-
-    #[test]
-    fn test_parser_empty_code_block() {
-        let md = "```\n```";
-        let blocks = parse(md, h());
-        assert_eq!(blocks.len(), 1);
-        match &blocks[0] {
-            RenderedBlock::CodeBlock {
-                highlighted_lines, ..
-            } => {
-                assert!(
-                    highlighted_lines.is_empty(),
-                    "empty code block should produce no lines"
-                );
-            }
-            _ => panic!("expected CodeBlock"),
-        }
-    }
-
-    #[test]
-    fn test_parser_list_with_paragraphs_emits_no_stray_paragraphs() {
-        // pulldown-cmark wraps list items in Tag::Paragraph when separated by blank lines.
-        // The Skipping guard must suppress those inner paragraphs.
-        let md = "- First item\n\n- Second item\n\nAfter list";
-        let blocks = parse(md, h());
-        let para_count = blocks
-            .iter()
-            .filter(|b| matches!(b, RenderedBlock::Paragraph { .. }))
-            .count();
-        assert_eq!(
-            para_count, 1,
-            "only the paragraph after the list should appear, got {para_count}"
-        );
-    }
-
-    // ── Font slot strategy tests ────────────────────────────────
-
-    #[test]
-    fn test_parser_heading_h4_bold_italic() {
-        let blocks = parse("#### Sub-heading", h());
-        assert_eq!(blocks.len(), 1);
-        match &blocks[0] {
-            RenderedBlock::Heading { level, content } => {
-                assert_eq!(*level, 4);
-                let mods = content[0].style.add_modifier;
-                assert!(mods.contains(Modifier::BOLD), "h4 should have BOLD");
-                assert!(mods.contains(Modifier::ITALIC), "h4 should have ITALIC");
-            }
-            _ => panic!("expected Heading block"),
-        }
-    }
-
-    #[test]
-    fn test_parser_heading_styles_distinct_modifiers() {
-        let h1 = default_heading_style(1);
-        let h4 = default_heading_style(4);
-        // h1 has BOLD only
-        assert!(h1.add_modifier.contains(Modifier::BOLD));
-        assert!(!h1.add_modifier.contains(Modifier::ITALIC));
-        // h4 has BOLD + ITALIC
-        assert!(h4.add_modifier.contains(Modifier::BOLD));
-        assert!(h4.add_modifier.contains(Modifier::ITALIC));
-    }
-
-    #[test]
-    fn test_parser_inline_code_has_bold_italic() {
-        let style = default_code_style();
-        assert!(
-            style.add_modifier.contains(Modifier::BOLD),
-            "inline code should have BOLD"
-        );
-        assert!(
-            style.add_modifier.contains(Modifier::ITALIC),
-            "inline code should have ITALIC"
-        );
-    }
-
-    #[test]
-    fn test_parser_link_text_has_italic() {
-        let blocks = parse("[click here](https://example.com)", h());
-        assert_eq!(blocks.len(), 1);
-        match &blocks[0] {
-            RenderedBlock::Paragraph { content } => {
-                assert_eq!(content[0].text, "click here");
-                assert!(
-                    content[0].style.add_modifier.contains(Modifier::ITALIC),
-                    "link text should have ITALIC"
-                );
-            }
-            _ => panic!("expected Paragraph block"),
-        }
-    }
-
-    #[test]
-    fn test_font_slots_file_parses_without_panic() {
-        let source = include_str!("../testdata/font-slots.md");
-        let blocks = parse(source, h());
-        assert!(blocks.len() > 20, "font-slots.md should produce many blocks");
-        // Verify it contains all expected block types.
-        let has_heading = blocks.iter().any(|b| matches!(b, RenderedBlock::Heading { .. }));
-        let has_paragraph = blocks.iter().any(|b| matches!(b, RenderedBlock::Paragraph { .. }));
-        let has_code = blocks.iter().any(|b| matches!(b, RenderedBlock::CodeBlock { .. }));
-        let has_rule = blocks.iter().any(|b| matches!(b, RenderedBlock::ThematicBreak));
-        assert!(has_heading, "should have headings");
-        assert!(has_paragraph, "should have paragraphs");
-        assert!(has_code, "should have code blocks");
-        assert!(has_rule, "should have thematic breaks");
-    }
-
-    // ── Security regression tests ────────────────────────────────
-
-    #[test]
-    fn test_parser_info_string_first_word_only() {
-        // pulldown-cmark yields the full info string — we must take only first word.
-        // Formats like "rust,no_run", "python title=\"x.py\"" are common in docs.
-        let cases = [
-            ("```rust,no_run\ncode\n```", "rust"),
-            ("```python title=\"x.py\"\ncode\n```", "python"),
-            ("```javascript highlight=true\ncode\n```", "javascript"),
-            ("```   rust   \ncode\n```", "rust"), // leading/trailing spaces trimmed by pulldown-cmark
-        ];
-        for (md, expected_lang) in cases {
-            let blocks = parse(md, h());
-            assert_eq!(blocks.len(), 1, "input: {md}");
-            match &blocks[0] {
-                RenderedBlock::CodeBlock { language, .. } => {
-                    assert_eq!(
-                        language, expected_lang,
-                        "info string '{md}' should yield language '{expected_lang}', got '{language}'"
-                    );
-                }
-                _ => panic!("expected CodeBlock for: {md}"),
-            }
-        }
-    }
-}
+#[path = "parser_tests.rs"]
+mod tests;
